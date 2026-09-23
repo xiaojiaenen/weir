@@ -1,0 +1,50 @@
+# Example: MySQL → JDBC sink, reconciled with a git-style PK diff.
+#
+# PK diff compares the source key set against the target key set:
+#   source-only -> insert, target-only -> delete, both-but-different -> rewrite.
+# It requires a target Weir can read back (target.type: jdbc).
+name: orders-pk-diff
+mode: diff
+source:
+  type: mysql
+  url: jdbc:mysql://127.0.0.1:3306/oltp?useSSL=false&serverTimezone=UTC
+  user: sync_reader
+  password: change-me
+  read:
+    mode: table
+    table: orders
+    # Keep the projection narrow: every extra column is compared and hashed.
+    columns: [id, user_id, status, amount, update_time]
+    primaryKey: [id]
+    incremental:
+      strategy: id
+      idColumn: id
+    splits:
+      column: id
+      numPartitions: 4
+      mode: parallel
+      strategy: range
+    deleteDetect:
+      # pk_diff      — full key-set + content reconciliation every pass
+      # fingerprint  — hash the source first, only reconcile when it moved
+      mode: fingerprint
+      fingerprintColumn: update_time
+target:
+  type: jdbc
+  url: jdbc:mysql://127.0.0.1:3306/dw?useSSL=false&serverTimezone=UTC
+  user: sync_writer
+  password: change-me
+  table: ods_orders
+  writeMode: merge
+  primaryKey: [id]
+state:
+  type: file
+  path: ./.weir/state
+runtime:
+  extractThreads: 4
+  writeBatchSize: 2000
+  maxRowsPerSec: 20000
+  reportPath: ./.weir/reports
+quality:
+  compareRowContent: true
+  rowCountCheck: true

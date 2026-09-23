@@ -1,0 +1,33 @@
+# Example: MySQL → Paimon PK table
+name: orders-to-paimon
+mode: incremental
+source:
+  type: mysql
+  url: jdbc:mysql://127.0.0.1:3306/oltp?useSSL=false&serverTimezone=UTC
+  user: sync_reader
+  password: change-me
+  read:
+    mode: table
+    table: orders
+    columns: [id, user_id, status, amount, update_time]
+    primaryKey: [id]
+    incremental:
+      strategy: update_time_id
+      column: update_time
+      idColumn: id
+      overlap: 5m
+target:
+  type: paimon
+  warehouse: hdfs:///lake/paimon
+  catalogDb: ods
+  table: orders
+  writeMode: merge
+  primaryKey: [id]
+  options:
+    # paimon table/catalog options
+    bucket: "4"
+state:
+  type: jdbc
+  url: jdbc:mysql://meta:3306/weir_meta
+  user: weir
+  password: change-me

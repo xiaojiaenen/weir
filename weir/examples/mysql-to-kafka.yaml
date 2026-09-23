@@ -1,0 +1,27 @@
+# Example: MySQL → Kafka JSON
+name: orders-to-kafka
+mode: incremental
+source:
+  type: mysql
+  url: jdbc:mysql://127.0.0.1:3306/oltp?useSSL=false&serverTimezone=UTC
+  user: sync_reader
+  password: change-me
+  read:
+    mode: table
+    table: orders
+    columns: [id, user_id, status, amount, update_time]
+    primaryKey: [id]
+    incremental:
+      strategy: update_time_id
+      column: update_time
+      idColumn: id
+      overlap: 5m
+target:
+  type: kafka
+  bootstrapServers: kafka-1:9092,kafka-2:9092
+  topic: ods.orders
+  acks: all
+  primaryKey: [id]
+state:
+  type: file
+  path: ./.weir/state

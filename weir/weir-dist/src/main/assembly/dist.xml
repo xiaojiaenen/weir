@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.1.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.1.0 https://maven.apache.org/xsd/assembly-2.1.0.xsd">
+  <id>dist</id>
+  <formats>
+    <format>tar.gz</format>
+    <format>dir</format>
+  </formats>
+  <!-- tar.gz top-level is weir-${version}/; dir format must not double-wrap -->
+  <includeBaseDirectory>false</includeBaseDirectory>
+  <fileSets>
+    <fileSet>
+      <directory>${project.basedir}/src/main/dist/bin</directory>
+      <outputDirectory>bin</outputDirectory>
+      <fileMode>0755</fileMode>
+      <includes>
+        <include>*</include>
+      </includes>
+    </fileSet>
+    <fileSet>
+      <directory>${project.basedir}/src/main/dist/conf</directory>
+      <outputDirectory>conf</outputDirectory>
+      <includes>
+        <include>*</include>
+      </includes>
+    </fileSet>
+    <fileSet>
+      <directory>${project.basedir}/../examples</directory>
+      <outputDirectory>examples</outputDirectory>
+      <includes>
+        <include>*.yaml</include>
+      </includes>
+    </fileSet>
+    <!-- 内置 H2 demo：只需 init.sql，源库由 JDBC URL 的 INIT=RUNSCRIPT 首次连接时自动创建 -->
+    <fileSet>
+      <directory>${project.basedir}/../demo</directory>
+      <outputDirectory>demo</outputDirectory>
+      <includes>
+        <include>init.sql</include>
+      </includes>
+    </fileSet>
+  </fileSets>
+  <dependencySets>
+    <dependencySet>
+      <outputDirectory>lib</outputDirectory>
+      <useProjectArtifact>false</useProjectArtifact>
+      <unpack>false</unpack>
+    </dependencySet>
+    <dependencySet>
+      <outputDirectory>lib</outputDirectory>
+      <useProjectArtifact>true</useProjectArtifact>
+      <unpack>false</unpack>
+    </dependencySet>
+  </dependencySets>
+</assembly>

@@ -1,0 +1,43 @@
+# Example: full + incremental MySQL → JSONL (no CDC required)
+name: orders-to-file
+mode: incremental
+source:
+  type: mysql
+  url: jdbc:mysql://127.0.0.1:3306/oltp?useSSL=false&serverTimezone=UTC
+  user: sync_reader
+  password: change-me
+  poolMax: 8
+  read:
+    mode: table
+    table: public.orders
+    columns: [id, user_id, status, amount, update_time, is_deleted]
+    primaryKey: [id]
+    filter: "status <> 'TEST'"
+    incremental:
+      strategy: update_time_id
+      column: update_time
+      idColumn: id
+      overlap: 5m
+      batchRows: 50000
+      fetchSize: 5000
+    splits:
+      column: id
+      numPartitions: 4
+      mode: parallel
+    deleteDetect:
+      mode: soft_column
+      softColumn: is_deleted
+target:
+  type: file
+  path: ./data/orders.jsonl
+  format: jsonl
+state:
+  type: file
+  path: ./.weir/state
+runtime:
+  extractThreads: 4
+  writeBatchSize: 1000
+  maxRetries: 3
+  maxConcurrentQueries: 4
+quality:
+  rowCountCheck: true

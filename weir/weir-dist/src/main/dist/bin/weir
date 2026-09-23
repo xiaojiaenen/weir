@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Weir launcher — Hadoop-style: bin/weir <cmd> -c conf/job.yaml
+set -euo pipefail
+
+WEIR_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+export WEIR_HOME
+
+if [[ -f "${WEIR_HOME}/conf/weir-env.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "${WEIR_HOME}/conf/weir-env.sh"
+fi
+
+if [[ -z "${JAVA_HOME:-}" ]]; then
+  if command -v java >/dev/null 2>&1; then
+    JAVA_CMD=java
+  else
+    echo "ERROR: JAVA_HOME not set and java not on PATH" >&2
+    exit 1
+  fi
+else
+  JAVA_CMD="${JAVA_HOME}/bin/java"
+fi
+
+WEIR_CLASSPATH="${WEIR_HOME}/lib/*"
+# optional extra jars (drivers)
+if [[ -d "${WEIR_HOME}/lib" ]]; then
+  for j in "${WEIR_HOME}"/lib/*.jar; do
+    [[ -e "$j" ]] || continue
+  done
+fi
+
+# Allow user to drop JDBC drivers into lib/ or ext/
+if [[ -d "${WEIR_HOME}/ext" ]]; then
+  WEIR_CLASSPATH="${WEIR_CLASSPATH}:${WEIR_HOME}/ext/*"
+fi
+
+WEIR_OPTS="${WEIR_OPTS:-}"
+CMD="${1:-}"
+if [[ -z "$CMD" || "$CMD" == "-h" || "$CMD" == "--help" ]]; then
+  exec "$JAVA_CMD" $WEIR_OPTS -cp "${WEIR_CLASSPATH}" io.weir.cli.Main --help
+fi
+
+shift || true
+exec "$JAVA_CMD" $WEIR_OPTS -cp "${WEIR_CLASSPATH}" io.weir.cli.Main "$CMD" "$@"

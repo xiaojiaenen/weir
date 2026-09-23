@@ -1,0 +1,63 @@
+# Example: MySQL → JDBC sink with MERGE (effectively-once)
+name: orders-to-jdbc
+mode: incremental
+source:
+  type: mysql
+  url: jdbc:mysql://127.0.0.1:3306/oltp?useSSL=false&serverTimezone=UTC
+  user: sync_reader
+  password: change-me
+  # Hard ceiling on source connections held by parallel shards.
+  poolMax: 8
+  read:
+    mode: table
+    table: orders
+    columns: [id, user_id, status, amount, update_time, is_deleted]
+    primaryKey: [id]
+    incremental:
+      strategy: update_time_id
+      column: update_time
+      idColumn: id
+      overlap: 5m
+      fetchSize: 5000
+      # Bound one pass so a large backlog cannot pin the source for hours.
+      maxRowsPerRun: 500000
+    splits:
+      column: id
+      numPartitions: 4
+      mode: parallel
+      # auto | range | mod | hash | none
+      strategy: auto
+    deleteDetect:
+      mode: soft_column
+      softColumn: is_deleted
+target:
+  type: jdbc
+  url: jdbc:mysql://127.0.0.1:3306/dw?useSSL=false&serverTimezone=UTC
+  user: sync_writer
+  password: change-me
+  table: ods_orders
+  writeMode: merge
+  primaryKey: [id]
+state:
+  type: file
+  path: ./.weir/state
+runtime:
+  extractThreads: 4
+  writeBatchSize: 2000
+  maxRetries: 3
+  retryBackoffMs: 500
+  retryBackoffMaxMs: 10000
+  retryJitterMs: 250
+  maxRowsPerSec: 20000
+  # JSON run reports for `weir runs` and external scraping.
+  reportPath: ./.weir/reports
+quality:
+  rowCountCheck: true
+  preflightEnabled: true
+  # Promote these from warnings to hard failures once the job is trusted.
+  failOnMissingIndex: false
+  failOnWatermarkRegression: true
+  failOnQualityMismatch: false
+  # Re-read 1% of written rows and compare content hashes.
+  sampleHashCheck: 0.01
+  autoAddColumns: true

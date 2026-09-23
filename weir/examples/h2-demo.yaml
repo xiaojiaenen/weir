@@ -1,0 +1,30 @@
+# Local H2 demo used by tests / quick start without MySQL.
+# 第一次连接时 H2 会自动执行 demo/init.sql 建表并灌入种子数据（脚本幂等，可重复执行），
+# 所以仓库里不需要提交 demo/src.mv.db 二进制文件；删掉它下次运行会自动重建。
+# 注意：./demo/... 是相对「当前工作目录」解析的，请在 weir/ 目录下执行。
+name: h2-demo
+mode: full
+source:
+  type: h2
+  url: jdbc:h2:./demo/src;MODE=MySQL;INIT=RUNSCRIPT FROM './demo/init.sql'
+  user: sa
+  password: ""
+  read:
+    mode: table
+    table: orders
+    columns: [id, user_id, amount, update_time]
+    primaryKey: [id]
+    incremental:
+      strategy: id
+      idColumn: id
+      fetchSize: 100
+    splits:
+      column: id
+      numPartitions: 2
+target:
+  type: file
+  path: ./demo/out/orders.jsonl
+  format: jsonl
+state:
+  type: file
+  path: ./demo/state

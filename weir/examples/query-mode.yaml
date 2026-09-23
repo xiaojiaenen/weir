@@ -1,0 +1,29 @@
+# Example: constrained SQL mode (must project PK + incremental column)
+name: orders-wide-sql
+mode: incremental
+source:
+  type: mysql
+  url: jdbc:mysql://127.0.0.1:3306/oltp?useSSL=false&serverTimezone=UTC
+  user: sync_reader
+  password: change-me
+  read:
+    mode: query
+    query: |
+      SELECT o.id, o.user_id, o.amount, o.update_time, u.channel
+      FROM orders o
+      JOIN users u ON u.id = o.user_id
+    primaryKey: [id]
+    incremental:
+      strategy: update_time_id
+      column: update_time
+      idColumn: id
+      overlap: 10m
+      batchRows: 20000
+target:
+  type: file
+  path: ./data/orders-wide.jsonl
+  format: jsonl
+  primaryKey: [id]
+state:
+  type: file
+  path: ./.weir/state

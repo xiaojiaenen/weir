@@ -1,0 +1,28 @@
+# Copy to conf/job.yaml and edit. Also used as a smoke template.
+name: demo-console
+mode: full
+source:
+  type: h2
+  url: jdbc:h2:./demo/src;MODE=MySQL;DB_CLOSE_DELAY=-1
+  user: sa
+  password: ""
+  read:
+    mode: table
+    table: orders
+    columns: [id, user_id, amount, update_time]
+    primaryKey: [id]
+    incremental:
+      strategy: id
+      idColumn: id
+    splits:
+      column: id
+      numPartitions: 2
+      mode: parallel
+target:
+  type: console
+state:
+  type: file
+  path: ./data/state
+runtime:
+  extractThreads: 2
+  writeBatchSize: 100

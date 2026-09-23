@@ -1,0 +1,22 @@
+# Maven build output
+target/
+
+# IDE / OS
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.DS_Store
+
+# WorkBuddy workspace metadata (本地记忆，不入库)
+.workbuddy/
+.tools/
+
+# Weir runtime artifacts
+.weir/
+**/demo/out/
+**/demo/state/
+**/demo/*.trace.db
+**/demo/src.mv.db
+*.log
