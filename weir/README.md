@@ -112,6 +112,8 @@ cat demo/out/orders.jsonl
 | 抽样哈希核对 | ✅ | `quality.sampleHashCheck` |
 | 软删 → DELETE / Doris / Paimon | ✅ | 支持自定义真值 `softTrueValues` |
 | PK Diff（insert/delete/rewrite） | ✅ | 值规范化比对，二次 diff 为零写入 |
+| **流式 pk_diff（大表不驻留内存）** | ✅ | 单列主键按 keyset 分页逐窗口比对，内存 O(窗口)（`runtime.diffWindowRows`，默认 5000）；复合主键走整表比对 |
+| **并行分片写（多连接）** | ✅ | 并行全量时每个 worker 独立 writer/连接，写吞吐随并行度扩展，不再单连接串行 |
 | 分区指纹 diff | ✅ | 指纹未变则跳过行级扫描 |
 | Schema 加列自动演进 | ✅ | 各方言 DDL |
 | CLI 完整运维命令 | ✅ | run/full/incremental/diff/check/state/runs/reset/plan/exec-shard |
@@ -191,6 +193,18 @@ weir exec-shard   -c examples/mysql-to-file.yaml --shard-index 1   # 只跑一�
 3. 非数值 → 厂商哈希分片（`CRC32` / `hashtext` / `ORA_HASH` / `CHECKSUM`）；
 4. 都不支持 → 降级单分片并告警，绝不产出坏 SQL。
 
+### 流式 pk_diff（大表友好）
+
+1. 目标端按主键做 keyset 分页（`WHERE pk > ? ORDER BY pk LIMIT n`），每页定义一个比对窗口；
+2. 源端对每个窗口用索引范围查询 `pk > ? AND pk <= ?` 探测（参数绑定，类型不匹配由 SQL 隐式转换吸收）；
+3. 窗口内 insert / delete / rewrite 即时产出，内存始终 O(窗口)（`runtime.diffWindowRows`，默认 5000）；
+4. 目标为空 → 尾部流式直通全部为 insert；窗口边界（跨页删/插）由测试覆盖；
+5. 复合主键回退整表比对路径（多列 keyset 谓词各方言差异大，暂不暴露）。
+
+### 并行全量的多连接写
+
+`splits.mode: parallel`（或 `extractThreads > 1`）且分片数 > 1 时，**每个并行 worker 持有自己的 writer 连接**，JDBC 写不再在全局锁内串行——写吞吐随并行度扩展。跨 worker 的行数与抽样通过共享计数器聚合，质量检查结果不受影响。
+
 ### Sink 的 DML 按列集合缓存
 
 同一个 diff 批次里既有「只有主键 + `_op=d`」的删除标记，也有完整行。Sink 按列集合分组建语句，避免删除标记把后续整行的 upsert 语句降级成只写主键。
@@ -213,7 +227,8 @@ weir exec-shard   -c examples/mysql-to-file.yaml --shard-index 1   # 只跑一�
 - `state`: `file`（默认）或 `jdbc`
 - `runtime.reportPath` 非空时每次运行落一份 JSON 报告
 - `runtime.fullCheckpoint: true`（默认）时全量按分片 checkpoint；`weir full` 崩溃后重跑只补未完成分片
-- `splits.numPartitions > 1` 才会真正并行抽取（`splits.mode: parallel` 或 `runtime.extractThreads > 1` 时并行执行）
+- `splits.numPartitions > 1` 才会真正并行抽取（`splits.mode: parallel` 或 `runtime.extractThreads > 1` 时并行执行），并行写随之启用
+- `runtime.diffWindowRows`：流式 pk_diff 的窗口行数，内存敏感场景调小、想减少往返调大
 
 完整样例见 `examples/`。
 
@@ -233,5 +248,5 @@ MVP 可用 Shell：`/opt/weir/bin/weir incremental -c /path/job.yaml`。
 
 ```bash
 mvn -q -DskipTests package
-mvn -q test        # 61 个用例（core 59 + paimon 2），含 H2 端到端、分片 checkpoint 续跑与 Paimon 本地表
+mvn -q test        # 62 个用例（core 60 + paimon 2），含 H2 端到端、分片 checkpoint 续跑与 Paimon 本地表
 ```

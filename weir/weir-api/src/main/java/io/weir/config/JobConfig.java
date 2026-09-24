@@ -153,6 +153,12 @@ public class JobConfig {
      * plan changes.
      */
     public boolean fullCheckpoint = true;
+    /**
+     * Rows per PK window in the streaming pk_diff reconcile. Both source and target are compared
+     * one window at a time, so memory stays O(window) regardless of table size. Single-column PKs
+     * only; larger values trade memory for fewer round trips.
+     */
+    public int diffWindowRows = 5_000;
   }
 
   @JsonIgnoreProperties(ignoreUnknown = true)

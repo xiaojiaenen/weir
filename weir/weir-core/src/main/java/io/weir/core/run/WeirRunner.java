@@ -127,13 +127,16 @@ public final class WeirRunner {
       writer.open();
       List<String> pk = config.effectivePrimaryKeys();
       int batch = Math.max(1, config.runtime.writeBatchSize);
-      BatchSink sink = new BatchSink(writer, batch, metrics);
+      // Shared totals so per-thread sinks in the parallel FULL path roll up into one number.
+      AtomicLong writtenTotal = new AtomicLong();
+      List<DataRow> sharedSample = new ArrayList<>();
+      BatchSink sink = new BatchSink(writer, batch, metrics, writtenTotal, sharedSample);
 
       JdbcExtractor.ExtractStats stats;
       long extractStart = System.currentTimeMillis();
       if (mode == RunMode.FULL) {
         if (config.runtime.fullCheckpoint) {
-          stats = runFullCheckpointed(extractor, sink, state, findings);
+          stats = runFullCheckpointed(extractor, sink, state, findings, writtenTotal, sharedSample);
         } else {
           stats = extractor.extractFull(sink);
         }
@@ -261,7 +264,12 @@ public final class WeirRunner {
    * accumulated watermark is committed exactly like the plain path.
    */
   private JdbcExtractor.ExtractStats runFullCheckpointed(
-      JdbcExtractor extractor, BatchSink sink, StateStore state, List<String> findings)
+      JdbcExtractor extractor,
+      BatchSink sink,
+      StateStore state,
+      List<String> findings,
+      AtomicLong writtenTotal,
+      List<DataRow> sharedSample)
       throws SQLException {
     io.weir.core.extract.SplitPlanner.Plan plan = extractor.planShards();
     plan.warnings().forEach(w -> log.warn("weir split {}", w));
@@ -292,6 +300,7 @@ public final class WeirRunner {
             Math.min(
                 parallel ? config.runtime.extractThreads : 1,
                 Math.max(1, config.runtime.maxConcurrentQueries)));
+    int batch = Math.max(1, config.runtime.writeBatchSize);
 
     JdbcExtractor.ExtractStats stats = new JdbcExtractor.ExtractStats();
     ShardProgress[] current = {progress};
@@ -309,6 +318,8 @@ public final class WeirRunner {
         runAndCheckpointOne(extractor, sink, state, plan, planId, index, stats, current, progressLock);
       }
     } else {
+      // Each worker owns its writer/connection so JDBC writes no longer serialise behind one
+      // shared BatchSink — with N threads the write throughput scales with the pool.
       ExecutorService executor = Executors.newFixedThreadPool(threads);
       List<Future<?>> futures = new ArrayList<>();
       try {
@@ -316,9 +327,20 @@ public final class WeirRunner {
           futures.add(
               executor.submit(
                   () -> {
-                    try {
+                    try (RowWriter localWriter = writerFactory.create(config)) {
+                      localWriter.open();
+                      BatchSink localSink =
+                          new BatchSink(localWriter, batch, metrics, writtenTotal, sharedSample);
                       runAndCheckpointOne(
-                          extractor, sink, state, plan, planId, index, stats, current, progressLock);
+                          extractor,
+                          localSink,
+                          state,
+                          plan,
+                          planId,
+                          index,
+                          stats,
+                          current,
+                          progressLock);
                     } catch (SQLException | RuntimeException e) {
                       synchronized (failures) {
                         failures.add(
@@ -376,8 +398,10 @@ public final class WeirRunner {
       Object progressLock)
       throws SQLException {
     JdbcExtractor.ExtractStats one = FullShards.runShard(config, extractor, plan, index, sink);
+    // Flush outside the lock: each sink owns its writer, so shards write concurrently and only the
+    // progress bookkeeping is serialised.
+    sink.flush();
     synchronized (progressLock) {
-      sink.flush();
       current[0] = current[0].withShardDone(index, one.maxWatermark);
       state.saveFullProgress(config.name, current[0]);
       stats.merge(one);
@@ -470,15 +494,127 @@ public final class WeirRunner {
   }
 
   /**
-   * Git-style reconciliation: one source scan, one target read, then insert / delete / rewrite.
+   * Git-style reconciliation: insert / delete / rewrite.
    *
-   * <p>The target projection depends on whether content comparison is on — reading only PK columns
-   * while comparing full rows makes every row look changed, which is exactly the bug this replaces.
+   * <p>Single-column keys use a streaming windowed compare: the target is read in key-ordered
+   * keyset pages and the source is probed once per page with an indexed
+   * {@code pk > ? AND pk <= ?} range, so memory stays O(windowRows) and huge tables reconcile
+   * without ever being loaded whole. Composite keys keep the legacy whole-table scan — the keyset
+   * predicate for multi-column keys is dialect-specific and not worth the surface here.
    */
   private JdbcExtractor.ExtractStats reconcile(
       JdbcExtractor extractor, BatchSink sink, List<String> pkCols, List<String> findings)
       throws SQLException {
+    if (pkCols.size() == 1) {
+      return reconcileStreaming(extractor, sink, pkCols.get(0), findings);
+    }
+    return reconcileWholeTable(extractor, sink, pkCols, findings);
+  }
+
+  /** Memory-bounded path: one target page at a time, source probed per window. */
+  private JdbcExtractor.ExtractStats reconcileStreaming(
+      JdbcExtractor extractor, BatchSink sink, String pk, List<String> findings)
+      throws SQLException {
     JdbcExtractor.ExtractStats stats = new JdbcExtractor.ExtractStats();
+    boolean compareContent = config.quality.compareRowContent;
+    int window = Math.max(50, config.runtime.diffWindowRows);
+
+    long inserts = 0;
+    long deletes = 0;
+    long rewrites = 0;
+    long[] seen = {0};
+    boolean compareColsKnown = false;
+    List<String> compareCols = List.of();
+
+    // streamByPk is synchronous: it fills this list page by page, in key order, before returning.
+    List<List<DataRow>> pages = new ArrayList<>();
+    TargetReader.streamByPk(config, pk, List.of(), window, pages::add);
+
+    Object prevKey = null;
+    for (List<DataRow> page : pages) {
+      DataRow pageLast = page.get(page.size() - 1);
+      Object windowEnd = pageLast.get(pk);
+      Object windowStart = prevKey;
+
+      Map<String, DataRow> targetRows = new LinkedHashMap<>();
+      for (DataRow t : page) {
+        targetRows.put(PkDiff.keyOf(t, List.of(pk)), t);
+      }
+      Map<String, DataRow> sourceRows = new LinkedHashMap<>();
+      extractor.extractKeyWindow(
+          pk,
+          windowStart,
+          windowEnd,
+          row -> {
+            seen[0]++;
+            sourceRows.put(PkDiff.keyOf(row, List.of(pk)), row);
+          });
+
+      if (!compareColsKnown && compareContent) {
+        DataRow srcSample = sourceRows.isEmpty() ? null : sourceRows.values().iterator().next();
+        DataRow tgtSample = targetRows.isEmpty() ? null : targetRows.values().iterator().next();
+        compareCols = PkDiff.compareColumns(srcSample, tgtSample);
+        compareColsKnown = true;
+      }
+
+      for (Map.Entry<String, DataRow> e : sourceRows.entrySet()) {
+        DataRow t = targetRows.get(e.getKey());
+        if (t == null) {
+          sink.accept(e.getValue());
+          inserts++;
+        } else if (compareContent && PkDiff.rowDiffers(e.getValue(), t, List.of(pk), compareCols)) {
+          sink.accept(e.getValue());
+          rewrites++;
+        }
+      }
+      for (Map.Entry<String, DataRow> e : targetRows.entrySet()) {
+        if (!sourceRows.containsKey(e.getKey())) {
+          sink.accept(PkDiff.deleteMarker(PkDiff.pkValues(e.getValue(), List.of(pk)), List.of(pk)));
+          deletes++;
+        }
+      }
+      prevKey = windowEnd;
+    }
+
+    // Tail: every source row past the last target key can only be an insert — stream it straight
+    // through without materialising it. When the target was empty this is the entire source.
+    long[] tailInserts = {0};
+    extractor.extractKeyWindow(
+        pk,
+        prevKey,
+        null,
+        row -> {
+          seen[0]++;
+          sink.accept(row);
+          tailInserts[0]++;
+        });
+    inserts += tailInserts[0];
+
+    stats.rows = seen[0];
+    sink.flush();
+    metrics.addDeleted(deletes);
+    metrics.addRewritten(rewrites);
+    findings.add(
+        "pk_diff streaming window="
+            + window
+            + " source="
+            + seen[0]
+            + " insert="
+            + inserts
+            + " delete="
+            + deletes
+            + " rewrite="
+            + rewrites);
+    log.info("weir pk_diff {}", findings.get(findings.size() - 1));
+    return stats;
+  }
+
+  /** Legacy path for composite keys: both sides loaded whole. Memory O(table). */
+  private JdbcExtractor.ExtractStats reconcileWholeTable(
+      JdbcExtractor extractor, BatchSink sink, List<String> pkCols, List<String> findings)
+      throws SQLException {
+    JdbcExtractor.ExtractStats stats = new JdbcExtractor.ExtractStats();
+    findings.add("pk_diff composite key — using whole-table compare (memory O(table))");
 
     Map<String, DataRow> sourceRows = new LinkedHashMap<>();
     extractor.extractFull(row -> sourceRows.put(PkDiff.keyOf(row, pkCols), row));
@@ -660,12 +796,26 @@ public final class WeirRunner {
     private final List<DataRow> recent = new ArrayList<>();
     private final AtomicLong written = new AtomicLong();
     private final Object lock = new Object();
+    /** Cross-sink aggregation: parallel shards each own a writer but share one total. */
+    private final AtomicLong sharedWritten;
+    private final List<DataRow> sharedSample;
 
     BatchSink(RowWriter writer, int batchSize, RunMetrics metrics) {
+      this(writer, batchSize, metrics, null, null);
+    }
+
+    BatchSink(
+        RowWriter writer,
+        int batchSize,
+        RunMetrics metrics,
+        AtomicLong sharedWritten,
+        List<DataRow> sharedSample) {
       this.writer = writer;
       this.batchSize = batchSize;
       this.metrics = metrics;
       this.pending = new ArrayList<>(batchSize);
+      this.sharedWritten = sharedWritten;
+      this.sharedSample = sharedSample;
     }
 
     @Override
@@ -700,17 +850,32 @@ public final class WeirRunner {
       metrics.addWritten(batch.size());
       metrics.addBatch();
       written.addAndGet(batch.size());
-      if (recent.size() < SAMPLE_CAP) {
+      if (sharedWritten != null) {
+        sharedWritten.addAndGet(batch.size());
+      }
+      if (sharedSample != null) {
+        synchronized (sharedSample) {
+          if (sharedSample.size() < SAMPLE_CAP) {
+            int room = SAMPLE_CAP - sharedSample.size();
+            sharedSample.addAll(batch.subList(0, Math.min(room, batch.size())));
+          }
+        }
+      } else if (recent.size() < SAMPLE_CAP) {
         int room = SAMPLE_CAP - recent.size();
         recent.addAll(batch.subList(0, Math.min(room, batch.size())));
       }
     }
 
     long written() {
-      return written.get();
+      return sharedWritten != null ? sharedWritten.get() : written.get();
     }
 
     List<DataRow> recent() {
+      if (sharedSample != null) {
+        synchronized (sharedSample) {
+          return List.copyOf(sharedSample);
+        }
+      }
       synchronized (lock) {
         return List.copyOf(recent);
       }

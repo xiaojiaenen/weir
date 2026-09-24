@@ -387,6 +387,39 @@ public final class JdbcExtractor implements AutoCloseable {
     return out;
   }
 
+  /**
+   * Stream source rows whose single key column falls in the half-open window
+   * {@code (fromExclusive, toInclusive]}, in key order. A {@code null} {@code fromExclusive} means
+   * unbounded below, a {@code null} {@code toInclusive} means unbounded above — the diff runner
+   * walks the table one bounded window at a time so memory stays O(window).
+   *
+   * <p>Parameters are bound (not inlined) so a key taken from the target as {@code Long} still
+   * compares correctly against a source {@code Integer} column.
+   */
+  public ExtractStats extractKeyWindow(
+      String keyColumn, Object fromExclusive, Object toInclusive, Consumer<DataRow> consumer)
+      throws SQLException {
+    ExtractStats stats = new ExtractStats();
+    stats.shards = 1;
+    String key = dialect.quote(keyColumn);
+    List<String> conds = new ArrayList<>();
+    List<Object> params = new ArrayList<>();
+    if (fromExclusive != null) {
+      conds.add(key + " > ?");
+      params.add(fromExclusive);
+    }
+    if (toInclusive != null) {
+      conds.add(key + " <= ?");
+      params.add(toInclusive);
+    }
+    List<String> allConds = Sql.list(config.source.read.filter);
+    allConds.addAll(conds);
+    String where = Sql.and(allConds);
+    String sql = dialect.buildSelect(projection(), fromClause(), where, key, null);
+    fetchWithRetry(sql, params, stats, consumer);
+    return stats;
+  }
+
   /** Aggregate fingerprint over a window: count + sum of row hashes. */
   public Fingerprint fingerprint(String partitionColumn, Instant from, Instant to)
       throws SQLException {

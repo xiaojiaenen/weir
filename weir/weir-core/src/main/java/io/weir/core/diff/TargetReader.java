@@ -11,6 +11,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,6 +62,66 @@ public final class TargetReader {
       }
     }
     return out;
+  }
+
+  /**
+   * Stream the target table in primary-key order using keyset pagination
+   * ({@code WHERE pk > ? ORDER BY pk LIMIT n}). Memory stays O(batchRows) no matter how large the
+   * table is — this is what lets a diff pass reconcile an arbitrarily big table.
+   *
+   * <p>Single-column keys only: a composite keyset predicate is dialect-specific and the legacy
+   * full-scan path remains available for that case.
+   *
+   * @param columns columns to select; empty means {@code SELECT *}
+   */
+  public static void streamByPk(
+      JobConfig config,
+      String pkColumn,
+      List<String> columns,
+      int batchRows,
+      java.util.function.Consumer<List<DataRow>> batches)
+      throws SQLException {
+    if (!canRead(config)) {
+      throw new SQLException("streamByPk requires a readable jdbc target");
+    }
+    JdbcDialect dialect = Dialects.forUrl(config.target.url);
+    String pk = dialect.quote(pkColumn);
+    List<String> proj = columns.isEmpty() ? List.of() : columns.stream().map(dialect::quote).toList();
+    int limit = Math.max(1, batchRows);
+    Object lastKey = null;
+    boolean firstPage = true;
+    while (true) {
+      String where =
+          firstPage ? null : pk + " > ?";
+      String sql = dialect.buildSelect(proj, config.target.table, where, pk, limit);
+      List<DataRow> page = new ArrayList<>();
+      try (Connection conn = Jdbc.open(config.target.url, config.target.user, config.target.password);
+          PreparedStatement ps = conn.prepareStatement(sql)) {
+        if (!firstPage) {
+          ps.setObject(1, lastKey);
+        }
+        try (ResultSet rs = ps.executeQuery()) {
+          ResultSetMetaData md = rs.getMetaData();
+          int n = md.getColumnCount();
+          while (rs.next()) {
+            Map<String, Object> map = new LinkedHashMap<>();
+            for (int i = 1; i <= n; i++) {
+              map.put(md.getColumnLabel(i), rs.getObject(i));
+            }
+            page.add(new DataRow(map));
+          }
+        }
+      }
+      if (page.isEmpty()) {
+        return;
+      }
+      batches.accept(page);
+      lastKey = page.get(page.size() - 1).get(pkColumn);
+      firstPage = false;
+      if (page.size() < limit) {
+        return;
+      }
+    }
   }
 
   /** COUNT(*) on the target — the cheapest possible reconciliation. */
