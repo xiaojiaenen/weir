@@ -103,6 +103,22 @@ public final class JdbcExtractor implements AutoCloseable {
     return Sql.fromClause(config.source.read);
   }
 
+  /** Plan the full-snapshot shards without running them (used by the checkpointed FULL path). */
+  public SplitPlanner.Plan planShards() throws SQLException {
+    try (Connection probe = pool.borrow(Duration.ofSeconds(30))) {
+      return SplitPlanner.plan(probe, dialect, config.source.read);
+    }
+  }
+
+  /** Extract exactly one planned shard — the unit of work an external engine (Flink/Spark) runs. */
+  public ExtractStats extractShard(Shard shard, Consumer<DataRow> consumer) throws SQLException {
+    ExtractStats stats = new ExtractStats();
+    stats.shards = 1;
+    fetchShard(shard, config.source.read.splits == null ? null : config.source.read.splits.column,
+        null, stats, consumer);
+    return stats;
+  }
+
   public List<String> projection() {
     List<String> cols = config.source.read.columns;
     return cols == null || cols.isEmpty() ? List.of() : List.copyOf(cols);

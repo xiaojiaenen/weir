@@ -44,6 +44,33 @@ public final class Watermark {
     return ts == null && id == null;
   }
 
+  /** The further-ahead of two cursors: newer timestamp wins, then larger id. */
+  public static Watermark max(Watermark a, Watermark b) {
+    if (a == null || a.isEmpty()) {
+      return b == null ? a : b;
+    }
+    if (b == null || b.isEmpty()) {
+      return a;
+    }
+    if (a.ts != null && b.ts != null) {
+      int c = a.ts.compareTo(b.ts);
+      if (c != 0) {
+        return c > 0 ? a : b;
+      }
+    } else if (a.ts != null) {
+      return a;
+    } else if (b.ts != null) {
+      return b;
+    }
+    if (a.id == null) {
+      return b;
+    }
+    if (b.id == null) {
+      return a;
+    }
+    return a.id >= b.id ? a : b;
+  }
+
   public Watermark withTs(Instant newTs) {
     return new Watermark(newTs, this.id);
   }

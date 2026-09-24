@@ -147,6 +147,12 @@ public class JobConfig {
     public String reportPath = "";
     /** Emit metric lines to the log at the end of each run. */
     public boolean metricsEnabled = true;
+    /**
+     * Checkpoint per-shard progress during FULL syncs. A crashed run resumes from the first
+     * unfinished shard instead of re-scanning the whole table; progress is discarded when the shard
+     * plan changes.
+     */
+    public boolean fullCheckpoint = true;
   }
 
   @JsonIgnoreProperties(ignoreUnknown = true)

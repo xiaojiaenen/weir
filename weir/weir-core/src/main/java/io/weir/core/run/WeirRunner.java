@@ -19,6 +19,7 @@ import io.weir.model.RunMode;
 import io.weir.model.Watermark;
 import io.weir.spi.RowWriter;
 import io.weir.spi.RowWriterFactory;
+import io.weir.spi.ShardProgress;
 import io.weir.spi.StateStore;
 import java.sql.SQLException;
 import java.time.Instant;
@@ -28,6 +29,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,7 +62,7 @@ public final class WeirRunner {
     this.writerFactory = writerFactory;
   }
 
-  private static RowWriterFactory resolveFactory(JobConfig config) {
+  static RowWriterFactory resolveFactory(JobConfig config) {
     String type = config.target.type;
     for (RowWriterFactory factory : ServiceLoader.load(RowWriterFactory.class)) {
       if (factory.type().equalsIgnoreCase(type)) {
@@ -127,7 +132,11 @@ public final class WeirRunner {
       JdbcExtractor.ExtractStats stats;
       long extractStart = System.currentTimeMillis();
       if (mode == RunMode.FULL) {
-        stats = extractor.extractFull(sink);
+        if (config.runtime.fullCheckpoint) {
+          stats = runFullCheckpointed(extractor, sink, state, findings);
+        } else {
+          stats = extractor.extractFull(sink);
+        }
       } else if (mode == RunMode.DIFF) {
         stats = runDiff(extractor, sink, pk, state, findings);
       } else {
@@ -241,6 +250,143 @@ public final class WeirRunner {
           dur,
           e.getMessage() == null ? e.toString() : e.getMessage(),
           built);
+    }
+  }
+
+  /**
+   * FULL sync with per-shard checkpointing: every shard whose rows have been fully written is
+   * recorded, so a crashed run resumes from the first unfinished shard instead of re-scanning the
+   * table. Progress is keyed by a plan fingerprint — if the shard plan changes, the old progress
+   * is discarded rather than trusted. Once every shard has landed the progress is cleared and the
+   * accumulated watermark is committed exactly like the plain path.
+   */
+  private JdbcExtractor.ExtractStats runFullCheckpointed(
+      JdbcExtractor extractor, BatchSink sink, StateStore state, List<String> findings)
+      throws SQLException {
+    io.weir.core.extract.SplitPlanner.Plan plan = extractor.planShards();
+    plan.warnings().forEach(w -> log.warn("weir split {}", w));
+    List<io.weir.core.extract.Shard> shards = plan.shards();
+    String planId = FullShards.planId(plan, config, extractor.dialect());
+    ShardProgress progress =
+        state
+            .loadFullProgress(config.name)
+            .filter(p -> p.planId().equals(planId))
+            .orElseGet(() -> ShardProgress.empty(planId));
+    if (!progress.done().isEmpty()) {
+      findings.add(
+          "full checkpoint: resuming with "
+              + progress.done().size()
+              + "/"
+              + shards.size()
+              + " shards already done");
+    }
+
+    JobConfig.SourceConfig.ReadConfig.SplitConfig splits = config.source.read.splits;
+    boolean parallel =
+        shards.size() > 1
+            && (splits != null && "parallel".equalsIgnoreCase(splits.mode)
+                || config.runtime.extractThreads > 1);
+    int threads =
+        Math.max(
+            1,
+            Math.min(
+                parallel ? config.runtime.extractThreads : 1,
+                Math.max(1, config.runtime.maxConcurrentQueries)));
+
+    JdbcExtractor.ExtractStats stats = new JdbcExtractor.ExtractStats();
+    ShardProgress[] current = {progress};
+    Object progressLock = new Object();
+    java.util.List<SQLException> failures = new java.util.ArrayList<>();
+    java.util.List<Integer> todo = new ArrayList<>();
+    for (int i = 0; i < shards.size(); i++) {
+      if (!progress.done().contains(i)) {
+        todo.add(i);
+      }
+    }
+
+    if (threads <= 1 || todo.size() <= 1) {
+      for (int index : todo) {
+        runAndCheckpointOne(extractor, sink, state, plan, planId, index, stats, current, progressLock);
+      }
+    } else {
+      ExecutorService executor = Executors.newFixedThreadPool(threads);
+      List<Future<?>> futures = new ArrayList<>();
+      try {
+        for (int index : todo) {
+          futures.add(
+              executor.submit(
+                  () -> {
+                    try {
+                      runAndCheckpointOne(
+                          extractor, sink, state, plan, planId, index, stats, current, progressLock);
+                    } catch (SQLException | RuntimeException e) {
+                      synchronized (failures) {
+                        failures.add(
+                            e instanceof SQLException sql
+                                ? sql
+                                : new SQLException("shard extract failed: " + e.getMessage(), e));
+                      }
+                    }
+                  }));
+        }
+        for (Future<?> f : futures) {
+          try {
+            f.get();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("parallel full extract interrupted", e);
+          } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            if (cause instanceof SQLException sql) {
+              throw sql;
+            }
+            throw new SQLException("shard extract failed: " + cause.getMessage(), cause);
+          }
+        }
+      } finally {
+        executor.shutdown();
+        try {
+          executor.awaitTermination(30, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
+      if (!failures.isEmpty()) {
+        // Progress for the shards that did land is already persisted — the next run resumes.
+        throw failures.get(0);
+      }
+    }
+
+    stats.maxWatermark = current[0].maxWatermark();
+    state.clearFullProgress(config.name);
+    findings.add("full checkpoint: " + shards.size() + "/" + shards.size() + " shards done");
+    return stats;
+  }
+
+  /** Extract one shard, flush it, then record it done — or leave progress untouched on failure. */
+  private void runAndCheckpointOne(
+      JdbcExtractor extractor,
+      BatchSink sink,
+      StateStore state,
+      io.weir.core.extract.SplitPlanner.Plan plan,
+      String planId,
+      int index,
+      JdbcExtractor.ExtractStats stats,
+      ShardProgress[] current,
+      Object progressLock)
+      throws SQLException {
+    JdbcExtractor.ExtractStats one = FullShards.runShard(config, extractor, plan, index, sink);
+    synchronized (progressLock) {
+      sink.flush();
+      current[0] = current[0].withShardDone(index, one.maxWatermark);
+      state.saveFullProgress(config.name, current[0]);
+      stats.merge(one);
+      log.info(
+          "weir full shard {}/{} done rows={} wm={}",
+          index + 1,
+          plan.shards().size(),
+          one.rows,
+          one.maxWatermark);
     }
   }
 

@@ -100,6 +100,7 @@ cat demo/out/orders.jsonl
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | 全量抽取（半开分片 + 并行） | ✅ | `splits.strategy: auto\|range\|mod\|hash\|none` |
+| **全量分片级 checkpoint** | ✅ | 每个分片写成功即记录；崩溃后从第一个未完成分片续跑，不再整表重来（`runtime.fullCheckpoint`，默认开） |
 | 非数值主键分片 | ✅ | 数值走 range/mod，字符串键走 hash，不支持则降级单分片并告警 |
 | 增量 `id` / `update_time` / `update_time_id` + overlap | ✅ | 同时间戳按 id 兜底；overlap 找回回填行 |
 | 单趟行数上限 | ✅ | `incremental.maxRowsPerRun` |
@@ -113,9 +114,9 @@ cat demo/out/orders.jsonl
 | PK Diff（insert/delete/rewrite） | ✅ | 值规范化比对，二次 diff 为零写入 |
 | 分区指纹 diff | ✅ | 指纹未变则跳过行级扫描 |
 | Schema 加列自动演进 | ✅ | 各方言 DDL |
-| CLI 完整运维命令 | ✅ | run/full/incremental/diff/check/state/runs/reset |
+| CLI 完整运维命令 | ✅ | run/full/incremental/diff/check/state/runs/reset/plan/exec-shard |
+| **Flink / Spark 外置 Runner** | ✅ | 引擎无关分片契约：`weir plan` + `ShardTask`，见 [docs/external-runners.md](docs/external-runners.md) |
 | DS TaskChannel 插件 | ✅ | 见 `docs/ds-taskchannel.md` |
-| Flink / Spark 外置 Runner | 🔜 | 核心逻辑已与引擎解耦 |
 
 ## 5 分钟体验（内置 H2 demo）
 
@@ -159,7 +160,9 @@ weir incremental  -c examples/mysql-to-file.yaml   # 按 id / update_time 增量
 weir diff         -c examples/mysql-to-file.yaml   # 软删 / pk-diff / 指纹修正
 weir state        -c examples/mysql-to-file.yaml   # 查看水位
 weir runs         -c examples/mysql-to-file.yaml -n 10   # 运行历史
-weir reset        -c examples/mysql-to-file.yaml   # 清水位，下次重新引导
+weir reset        -c examples/mysql-to-file.yaml   # 清水位与分片 checkpoint，下次重新引导
+weir plan         -c examples/mysql-to-file.yaml   # 输出全量分片计划 JSON（外置引擎契约）
+weir exec-shard   -c examples/mysql-to-file.yaml --shard-index 1   # 只跑一个分片（外置引擎调用）
 ```
 
 退出码：`0` 成功，`1` 运行失败或质量门禁拦截，`2` 用法错误。
@@ -192,6 +195,14 @@ weir reset        -c examples/mysql-to-file.yaml   # 清水位，下次重新引
 
 同一个 diff 批次里既有「只有主键 + `_op=d`」的删除标记，也有完整行。Sink 按列集合分组建语句，避免删除标记把后续整行的 upsert 语句降级成只写主键。
 
+### 全量分片 checkpoint 与外置引擎
+
+1. 抽取前先 `SplitPlanner.plan` 得到分片，算出 `planId` 指纹（表 + 投影 + 每个分片谓词）；
+2. 每个分片**写成功后**才把 `planId + 已完成集合 + 游标最大值` 存进 StateStore（走 snapshot 元数据，file/jdbc 通用）；
+3. 崩溃重跑时若 `planId` 一致 → 跳过已完成分片；不一致（表/投影/分片配置变了）→ 进度作废重读，宁可重读不漏读；
+4. 全部完成后清进度、一次性提交水位；
+5. `weir plan` / `weir exec-shard` 把同一套语义暴露给 Flink/Spark/Shell，进度与 CLI 共用一份状态。
+
 ## 配置要点
 
 - `source.read.mode`: `table`（推荐）或 `query`（必须投影 `primaryKey` + 增量列）
@@ -201,6 +212,8 @@ weir reset        -c examples/mysql-to-file.yaml   # 清水位，下次重新引
 - `target.writeMode: merge` 时必须配置 `primaryKey`
 - `state`: `file`（默认）或 `jdbc`
 - `runtime.reportPath` 非空时每次运行落一份 JSON 报告
+- `runtime.fullCheckpoint: true`（默认）时全量按分片 checkpoint；`weir full` 崩溃后重跑只补未完成分片
+- `splits.numPartitions > 1` 才会真正并行抽取（`splits.mode: parallel` 或 `runtime.extractThreads > 1` 时并行执行）
 
 完整样例见 `examples/`。
 
@@ -220,5 +233,5 @@ MVP 可用 Shell：`/opt/weir/bin/weir incremental -c /path/job.yaml`。
 
 ```bash
 mvn -q -DskipTests package
-mvn -q test        # 56 个用例（core 54 + paimon 2），含 H2 端到端与 Paimon 本地表
+mvn -q test        # 61 个用例（core 59 + paimon 2），含 H2 端到端、分片 checkpoint 续跑与 Paimon 本地表
 ```
